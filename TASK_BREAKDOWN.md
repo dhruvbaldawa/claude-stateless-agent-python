@@ -3743,3 +3743,657 @@ Ensure all tests pass and the executor correctly executes single turns in a stat
 
 ---
 
+### 🔄 **Iteration 5: Public API Integration**
+
+This final iteration creates the user-facing API that maintains 100% backward compatibility with existing Claude SDK patterns while leveraging the new stateless architecture. Users can choose their storage backend or use the default file-based storage.
+
+---
+
+#### Task 10: Implement Public API Functions
+
+Status: **Pending**
+
+**Goal**: Create the public API entry points (`query()` function and `ClaudeSDKClient` class) that provide a simple, intuitive interface for agent execution while supporting pluggable storage backends.
+
+**Working Result**: A complete public API in `src/claude_agent_sdk/api.py` with the `query()` function for single queries and `ClaudeSDKClient` class for multi-turn conversations, both using AgentExecutor and SessionStore under the hood.
+
+**Validation**:
+- [ ] `query()` async function exists for single stateless queries
+- [ ] `ClaudeSDKClient` class exists for multi-turn conversations
+- [ ] `query()` accepts options with custom `session_store` parameter
+- [ ] Default storage backend is `FileSessionStore` when none specified
+- [ ] `ClaudeSDKClient` maintains session across multiple `query()` calls
+- [ ] Both API patterns support `resume` parameter for session continuation
+- [ ] Integration tests demonstrate file store and Redis store usage
+- [ ] `pytest tests/test_api.py -v` passes with full integration tests
+
+<prompt>
+You are implementing the public API for the Stateless Claude Agent SDK. This API provides backward-compatible entry points while supporting pluggable storage.
+
+1. **Create `src/claude_agent_sdk/api.py`** with the following implementation:
+
+```python
+"""Public API for Claude Agent SDK."""
+
+import uuid
+from typing import AsyncIterator, Optional
+from anthropic import AsyncAnthropic
+
+from claude_agent_sdk.executor import AgentExecutor, ClaudeAgentOptions
+from claude_agent_sdk.models import Message
+from claude_agent_sdk.stores.file_store import FileSessionStore
+
+
+async def query(
+    prompt: str,
+    options: Optional[ClaudeAgentOptions] = None
+) -> AsyncIterator[Message]:
+    """
+    Execute a single agent query.
+
+    This is the simplest entry point for one-off agent queries.
+    For multi-turn conversations, use ClaudeSDKClient instead.
+
+    Args:
+        prompt: User's message/prompt
+        options: Optional configuration (model, storage backend, etc.)
+
+    Yields:
+        Messages as they are created during execution
+
+    Examples:
+        >>> async for message in query("Hello, Claude!"):
+        ...     print(message.content)
+
+        >>> # Use Redis storage
+        >>> from claude_agent_sdk.stores import RedisSessionStore
+        >>> options = ClaudeAgentOptions(
+        ...     session_store=RedisSessionStore("redis://localhost:6379")
+        ... )
+        >>> async for message in query("Hello", options=options):
+        ...     print(message.content)
+    """
+    if options is None:
+        options = ClaudeAgentOptions()
+
+    # Set up storage backend
+    if options.session_store is None:
+        options.session_store = FileSessionStore()
+
+    # Set up Anthropic client
+    anthropic_client = AsyncAnthropic(api_key=options.anthropic_api_key)
+
+    # Create executor
+    executor = AgentExecutor(
+        session_store=options.session_store,
+        anthropic_client=anthropic_client,
+        options=options
+    )
+
+    # Generate session ID or use resume ID
+    session_id = options.resume or str(uuid.uuid4())
+
+    # Execute query
+    async for message in executor.execute_turn(session_id, prompt):
+        yield message
+
+
+class ClaudeSDKClient:
+    """
+    Client for multi-turn agent conversations.
+
+    Maintains a single session across multiple query calls,
+    enabling conversational context to be preserved.
+
+    Examples:
+        >>> client = ClaudeSDKClient()
+        >>> await client.query("What's 2+2?")
+        >>> await client.query("And what's that times 3?")
+        >>> await client.close()
+
+        >>> # Use Redis storage
+        >>> options = ClaudeAgentOptions(
+        ...     session_store=RedisSessionStore("redis://localhost")
+        ... )
+        >>> client = ClaudeSDKClient(options=options)
+
+        >>> # Use as async context manager
+        >>> async with ClaudeSDKClient() as client:
+        ...     await client.query("Hello")
+    """
+
+    def __init__(self, options: Optional[ClaudeAgentOptions] = None):
+        """
+        Initialize client.
+
+        Args:
+            options: Optional configuration
+        """
+        self.options = options or ClaudeAgentOptions()
+
+        # Set up storage backend
+        if self.options.session_store is None:
+            self.options.session_store = FileSessionStore()
+
+        # Set up Anthropic client
+        self.anthropic_client = AsyncAnthropic(
+            api_key=self.options.anthropic_api_key
+        )
+
+        # Create executor
+        self.executor = AgentExecutor(
+            session_store=self.options.session_store,
+            anthropic_client=self.anthropic_client,
+            options=self.options
+        )
+
+        # Session ID for this client
+        self.session_id = self.options.resume or str(uuid.uuid4())
+
+    async def query(self, prompt: str) -> AsyncIterator[Message]:
+        """
+        Execute a query in this client's session.
+
+        Args:
+            prompt: User's message
+
+        Yields:
+            Messages as they are created
+        """
+        async for message in self.executor.execute_turn(self.session_id, prompt):
+            yield message
+
+    async def get_session_id(self) -> str:
+        """
+        Get the current session ID.
+
+        Returns:
+            Session ID being used by this client
+        """
+        return self.session_id
+
+    async def close(self):
+        """
+        Clean up resources.
+
+        Closes the storage backend connection.
+        """
+        if hasattr(self.options.session_store, 'close'):
+            await self.options.session_store.close()
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
+```
+
+2. **Update `src/claude_agent_sdk/__init__.py`** to export the public API:
+
+```python
+"""Claude Agent SDK - Stateless agent execution with pluggable storage."""
+
+__version__ = "0.1.0"
+
+# Core models
+from claude_agent_sdk.models import (
+    SessionState,
+    SessionMetadata,
+    CompactionState,
+    Message,
+    PermissionMode,
+)
+
+# Protocols
+from claude_agent_sdk.protocols import (
+    SessionStore,
+    SessionNotFoundError,
+    StorageError,
+    ConcurrencyError,
+)
+
+# Storage backends
+from claude_agent_sdk.stores import FileSessionStore, RedisSessionStore
+
+# Executor
+from claude_agent_sdk.executor import AgentExecutor, ClaudeAgentOptions
+
+# Public API
+from claude_agent_sdk.api import query, ClaudeSDKClient
+
+__all__ = [
+    # Version
+    "__version__",
+    # Models
+    "SessionState",
+    "SessionMetadata",
+    "CompactionState",
+    "Message",
+    "PermissionMode",
+    # Protocols
+    "SessionStore",
+    "SessionNotFoundError",
+    "StorageError",
+    "ConcurrencyError",
+    # Stores
+    "FileSessionStore",
+    "RedisSessionStore",
+    # Executor
+    "AgentExecutor",
+    "ClaudeAgentOptions",
+    # Public API
+    "query",
+    "ClaudeSDKClient",
+]
+```
+
+3. **Create integration tests** in `tests/test_api.py`:
+
+```python
+"""Integration tests for public API."""
+
+import pytest
+from unittest.mock import AsyncMock, patch
+from claude_agent_sdk.api import query, ClaudeSDKClient
+from claude_agent_sdk.executor import ClaudeAgentOptions
+from claude_agent_sdk.stores.file_store import FileSessionStore
+
+
+# Helper to create mock Anthropic stream
+def mock_anthropic_stream(text: str):
+    """Create a mock Anthropic API stream."""
+    class MockContentBlock:
+        type = "text"
+
+    class MockDelta:
+        type = "text_delta"
+        def __init__(self, text):
+            self.text = text
+
+    class MockEvent:
+        def __init__(self, event_type, **kwargs):
+            self.type = event_type
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    async def stream():
+        yield MockEvent("content_block_start", content_block=MockContentBlock())
+        yield MockEvent("content_block_delta", delta=MockDelta(text))
+        yield MockEvent("message_stop")
+
+    return stream()
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_query_basic(mock_anthropic, tmp_path):
+    """Test basic query() function."""
+    # Setup mock
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_anthropic_stream("Hello!")
+    mock_anthropic.return_value = mock_client
+
+    # Use temporary file store
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    # Execute query
+    messages = []
+    async for message in query("Hi", options=options):
+        messages.append(message)
+
+    # Verify
+    assert len(messages) == 2  # user + assistant
+    assert messages[0].role == "user"
+    assert messages[0].content == "Hi"
+    assert messages[1].role == "assistant"
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_query_with_file_store(mock_anthropic, tmp_path):
+    """Test that query() uses FileSessionStore by default."""
+    # Setup mock
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_anthropic_stream("Response")
+    mock_anthropic.return_value = mock_client
+
+    # Execute query with file store
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    async for _ in query("Test", options=options):
+        pass
+
+    # Verify session was saved to file system
+    projects_dir = tmp_path / "projects"
+    assert projects_dir.exists()
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_query_resume_session(mock_anthropic, tmp_path):
+    """Test resuming a session with query()."""
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_anthropic.return_value = mock_client
+
+    store = FileSessionStore(base_path=tmp_path)
+    session_id = "test-resume-session"
+
+    # First query
+    mock_client.messages.create.return_value = mock_anthropic_stream("First response")
+    options1 = ClaudeAgentOptions(session_store=store, resume=session_id)
+
+    async for _ in query("First message", options=options1):
+        pass
+
+    # Second query (resume)
+    mock_client.messages.create.return_value = mock_anthropic_stream("Second response")
+    options2 = ClaudeAgentOptions(session_store=store, resume=session_id)
+
+    async for _ in query("Second message", options=options2):
+        pass
+
+    # Verify session has multiple messages
+    session = await store.load_session(session_id)
+    assert len(session.messages) >= 3  # First user/assistant + second user
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_client_multi_turn(mock_anthropic, tmp_path):
+    """Test ClaudeSDKClient for multi-turn conversation."""
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_anthropic.return_value = mock_client
+
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    client = ClaudeSDKClient(options=options)
+
+    # First turn
+    mock_client.messages.create.return_value = mock_anthropic_stream("Response 1")
+    messages1 = []
+    async for msg in client.query("Message 1"):
+        messages1.append(msg)
+
+    # Second turn (same session)
+    mock_client.messages.create.return_value = mock_anthropic_stream("Response 2")
+    messages2 = []
+    async for msg in client.query("Message 2"):
+        messages2.append(msg)
+
+    await client.close()
+
+    # Verify both turns executed
+    assert len(messages1) == 2
+    assert len(messages2) == 2
+
+    # Verify session preserved across calls
+    session_id = await client.get_session_id()
+    session = await options.session_store.load_session(session_id)
+    assert len(session.messages) >= 4  # 2 turns x 2 messages each
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_client_context_manager(mock_anthropic, tmp_path):
+    """Test ClaudeSDKClient as async context manager."""
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_anthropic_stream("Response")
+    mock_anthropic.return_value = mock_client
+
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        async for _ in client.query("Test"):
+            pass
+
+    # Context manager should have called close()
+    # File store doesn't track this, but no errors should occur
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_client_get_session_id(mock_anthropic, tmp_path):
+    """Test getting session ID from client."""
+    mock_client = AsyncMock()
+    mock_anthropic.return_value = mock_client
+
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    client = ClaudeSDKClient(options=options)
+    session_id = await client.get_session_id()
+
+    assert session_id is not None
+    assert isinstance(session_id, str)
+    assert len(session_id) > 0
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_query_without_options(mock_anthropic, tmp_path):
+    """Test that query() works without explicit options."""
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_anthropic_stream("Response")
+    mock_anthropic.return_value = mock_client
+
+    # Patch the default FileSessionStore location
+    with patch('claude_agent_sdk.api.FileSessionStore') as mock_file_store:
+        mock_store_instance = AsyncMock()
+        mock_file_store.return_value = mock_store_instance
+
+        # Configure mock store
+        mock_store_instance.load_session = AsyncMock(return_value=None)
+        mock_store_instance.create_session = AsyncMock()
+        mock_store_instance.append_message = AsyncMock()
+        mock_store_instance.update_metadata = AsyncMock()
+
+        # Should use default options
+        async for _ in query("Test"):
+            pass
+
+        # Verify FileSessionStore was instantiated
+        mock_file_store.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_api_exports():
+    """Test that public API exports are available."""
+    from claude_agent_sdk import query, ClaudeSDKClient, ClaudeAgentOptions
+    from claude_agent_sdk import FileSessionStore, RedisSessionStore
+    from claude_agent_sdk import SessionStore, SessionState
+
+    # All key exports should be available
+    assert query is not None
+    assert ClaudeSDKClient is not None
+    assert ClaudeAgentOptions is not None
+    assert FileSessionStore is not None
+    assert RedisSessionStore is not None
+```
+
+4. **Create example usage documentation** in `tests/test_examples.py`:
+
+```python
+"""Example usage patterns for documentation."""
+
+import pytest
+from unittest.mock import patch, AsyncMock
+
+
+def mock_stream(text: str):
+    """Mock helper."""
+    class MockBlock:
+        type = "text"
+    class MockDelta:
+        type = "text_delta"
+        def __init__(self, t):
+            self.text = t
+    class MockEvent:
+        def __init__(self, event_type, **kwargs):
+            self.type = event_type
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    async def stream():
+        yield MockEvent("content_block_start", content_block=MockBlock())
+        yield MockEvent("content_block_delta", delta=MockDelta(text))
+        yield MockEvent("message_stop")
+    return stream()
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_example_simple_query(mock_anthropic):
+    """Example: Simple one-off query."""
+    from claude_agent_sdk import query
+
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_stream("Hello!")
+    mock_anthropic.return_value = mock_client
+
+    # Simple query
+    async for message in query("Hello, Claude!"):
+        if message.role == "assistant":
+            print(f"Claude says: {message.content}")
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_example_multi_turn_conversation(mock_anthropic, tmp_path):
+    """Example: Multi-turn conversation."""
+    from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+    from claude_agent_sdk.stores import FileSessionStore
+
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_anthropic.return_value = mock_client
+
+    # Create client for conversation
+    options = ClaudeAgentOptions(
+        session_store=FileSessionStore(base_path=tmp_path)
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        # First question
+        mock_client.messages.create.return_value = mock_stream("2+2 is 4")
+        async for message in client.query("What's 2+2?"):
+            pass
+
+        # Follow-up question (uses same session)
+        mock_client.messages.create.return_value = mock_stream("4*3 is 12")
+        async for message in client.query("What's that times 3?"):
+            pass
+
+
+@pytest.mark.asyncio
+@patch('claude_agent_sdk.api.AsyncAnthropic')
+async def test_example_redis_backend(mock_anthropic):
+    """Example: Using Redis storage backend."""
+    from claude_agent_sdk import query, ClaudeAgentOptions
+    from claude_agent_sdk.stores import RedisSessionStore
+
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock()
+    mock_client.messages.create.return_value = mock_stream("Response")
+    mock_anthropic.return_value = mock_client
+
+    # Use Redis for distributed deployment
+    with patch('claude_agent_sdk.stores.redis_store.redis.from_url') as mock_redis:
+        mock_redis.return_value = AsyncMock()
+
+        options = ClaudeAgentOptions(
+            session_store=RedisSessionStore("redis://localhost:6379")
+        )
+
+        async for message in query("Hello", options=options):
+            pass
+```
+
+5. **Run all integration tests**:
+   ```bash
+   pytest tests/test_api.py tests/test_examples.py -v
+   ```
+
+6. **Update README.md** with usage examples:
+
+```markdown
+# Claude Agent SDK (Stateless)
+
+Stateless Claude Agent SDK with pluggable storage backends.
+
+## Installation
+
+\`\`\`bash
+pip install -e .
+
+# Optional: Redis support
+pip install -e ".[redis]"
+
+# Optional: PostgreSQL support
+pip install -e ".[postgres]"
+
+# Development
+pip install -e ".[dev]"
+\`\`\`
+
+## Quick Start
+
+### Simple Query
+
+\`\`\`python
+from claude_agent_sdk import query
+
+async for message in query("Hello, Claude!"):
+    print(message.content)
+\`\`\`
+
+### Multi-Turn Conversation
+
+\`\`\`python
+from claude_agent_sdk import ClaudeSDKClient
+
+async with ClaudeSDKClient() as client:
+    await client.query("What's 2+2?")
+    await client.query("What's that times 3?")
+\`\`\`
+
+### Redis Storage (Distributed)
+
+\`\`\`python
+from claude_agent_sdk import query, ClaudeAgentOptions
+from claude_agent_sdk.stores import RedisSessionStore
+
+options = ClaudeAgentOptions(
+    session_store=RedisSessionStore("redis://localhost:6379")
+)
+
+async for message in query("Hello", options=options):
+    print(message.content)
+\`\`\`
+
+## Architecture
+
+See `ARCHITECTURE.md` for detailed design documentation.
+\`\`\`
+
+Ensure all tests pass and the public API is intuitive and well-documented.
+</prompt>
+
+---
+
