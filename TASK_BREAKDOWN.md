@@ -3213,3 +3213,533 @@ Ensure all tests pass with high coverage and RedisSessionStore fully implements 
 
 ---
 
+### 🔄 **Iteration 4: Stateless Agent Executor**
+
+This iteration implements the AgentExecutor, the core stateless execution engine that orchestrates agent behavior. The executor loads state from SessionStore, executes agent turns, and persists results back to storage without maintaining any internal state.
+
+---
+
+#### Task 9: Implement AgentExecutor Core Structure
+
+Status: **Pending**
+
+**Goal**: Create the foundational AgentExecutor class that loads session state from SessionStore, executes a single agent turn by calling Claude API, and persists messages back to storage in a completely stateless manner.
+
+**Working Result**: A working **AgentExecutor** class in `src/claude_agent_sdk/executor.py` that can execute a simple single-turn conversation (user message → Claude API → assistant response) with state loaded from and saved to any SessionStore implementation.
+
+**Validation**:
+- [ ] `AgentExecutor` class exists in `src/claude_agent_sdk/executor.py`
+- [ ] Constructor accepts `SessionStore`, `Anthropic` client, and `ClaudeAgentOptions`
+- [ ] `execute_turn()` method loads session, sends user message, calls Claude API
+- [ ] All messages (user and assistant) are persisted to SessionStore
+- [ ] Metadata (usage, costs, turn count) is updated after each turn
+- [ ] Executor has no instance state - all state comes from SessionStore
+- [ ] Unit tests use mock SessionStore and mock Anthropic client
+- [ ] `pytest tests/test_executor.py::test_basic_turn -v` passes
+
+<prompt>
+You are implementing the AgentExecutor, the stateless core of the Claude Agent SDK. This class orchestrates agent execution without maintaining any internal state.
+
+1. **Create `src/claude_agent_sdk/executor.py`** with the following implementation:
+
+```python
+"""Stateless agent execution engine."""
+
+import asyncio
+from typing import AsyncIterator, Optional
+from dataclasses import dataclass
+from anthropic import Anthropic, AsyncAnthropic
+from anthropic.types import Message as AnthropicMessage, MessageStreamEvent
+
+from claude_agent_sdk.protocols import SessionStore
+from claude_agent_sdk.models import (
+    SessionState,
+    SessionMetadata,
+    Message,
+    PermissionMode,
+)
+
+
+@dataclass
+class ClaudeAgentOptions:
+    """Configuration options for agent execution."""
+
+    model: str = "claude-sonnet-4-5-20250929"
+    """Claude model to use"""
+
+    session_store: Optional[SessionStore] = None
+    """Storage backend (defaults to FileSessionStore)"""
+
+    working_directory: str = "."
+    """Working directory for file operations"""
+
+    permission_mode: PermissionMode = PermissionMode.ASK
+    """How to handle tool execution"""
+
+    max_turns: int = 100
+    """Maximum number of conversation turns"""
+
+    resume: Optional[str] = None
+    """Session ID to resume"""
+
+    anthropic_api_key: Optional[str] = None
+    """Anthropic API key (defaults to ANTHROPIC_API_KEY env var)"""
+
+
+class AgentExecutor:
+    """
+    Stateless agent execution engine.
+
+    All state is loaded from SessionStore at the start of each operation
+    and persisted back after each message. The executor maintains NO
+    internal state between calls.
+    """
+
+    def __init__(
+        self,
+        session_store: SessionStore,
+        anthropic_client: AsyncAnthropic,
+        options: ClaudeAgentOptions
+    ):
+        """
+        Initialize executor.
+
+        Args:
+            session_store: Storage backend for session state
+            anthropic_client: Anthropic API client
+            options: Agent configuration options
+        """
+        self.store = session_store
+        self.client = anthropic_client
+        self.options = options
+
+    async def execute_turn(
+        self,
+        session_id: str,
+        user_message: str
+    ) -> AsyncIterator[Message]:
+        """
+        Execute a single agent turn.
+
+        This is the main entry point for agent execution. It:
+        1. Loads session state from store
+        2. Appends user message
+        3. Calls Claude API and streams response
+        4. Persists assistant message
+        5. Updates metadata
+
+        Args:
+            session_id: Session ID to execute turn in
+            user_message: User's message text
+
+        Yields:
+            Messages as they are created (user message, assistant message, etc.)
+        """
+        # Load or create session
+        session = await self.store.load_session(session_id)
+        if session is None:
+            session = await self._initialize_session(session_id)
+
+        # Check turn limit
+        if session.metadata.num_turns >= self.options.max_turns:
+            # TODO: Yield a result message indicating max turns reached
+            return
+
+        # Create and persist user message
+        user_msg = Message(
+            role="user",
+            content=user_message,
+            id=f"msg-{session.metadata.num_turns}-user"
+        )
+        await self.store.append_message(session_id, user_msg)
+        yield user_msg
+
+        # Build API request messages (convert from our Message type to Anthropic format)
+        api_messages = self._build_api_messages(session.messages + [user_msg])
+
+        # Call Claude API (streaming)
+        stream = await self.client.messages.create(
+            model=self.options.model,
+            max_tokens=4096,
+            messages=api_messages,
+            stream=True
+        )
+
+        # Process response stream
+        assistant_content = []
+        async for event in stream:
+            if event.type == "content_block_start":
+                if event.content_block.type == "text":
+                    assistant_content.append({"type": "text", "text": ""})
+            elif event.type == "content_block_delta":
+                if event.delta.type == "text_delta":
+                    # Accumulate text
+                    if assistant_content:
+                        assistant_content[-1]["text"] += event.delta.text
+            elif event.type == "message_stop":
+                # Message complete
+                break
+
+        # Create assistant message
+        assistant_msg = Message(
+            role="assistant",
+            content=assistant_content if assistant_content else "...",
+            id=f"msg-{session.metadata.num_turns}-assistant"
+        )
+
+        # Persist assistant message
+        await self.store.append_message(session_id, assistant_msg)
+        yield assistant_msg
+
+        # Update metadata
+        session.metadata.num_turns += 1
+        # TODO: Update costs and usage from API response
+        await self.store.update_metadata(session_id, session.metadata)
+
+    async def _initialize_session(self, session_id: str) -> SessionState:
+        """
+        Initialize a new session.
+
+        Creates session with default metadata in the store.
+        """
+        metadata = SessionMetadata(
+            model=self.options.model,
+            working_directory=self.options.working_directory,
+            permission_mode=self.options.permission_mode,
+        )
+
+        await self.store.create_session(session_id, metadata)
+
+        # Load and return the newly created session
+        session = await self.store.load_session(session_id)
+        if session is None:
+            raise RuntimeError(f"Failed to create session {session_id}")
+
+        return session
+
+    def _build_api_messages(self, messages: list[Message]) -> list[dict]:
+        """
+        Convert our Message format to Anthropic API format.
+
+        Args:
+            messages: List of our Message objects
+
+        Returns:
+            List of dicts suitable for Anthropic API
+        """
+        api_messages = []
+        for msg in messages:
+            api_msg = {
+                "role": msg.role,
+                "content": msg.content
+            }
+            api_messages.append(api_msg)
+
+        return api_messages
+```
+
+2. **Create unit tests** in `tests/test_executor.py`:
+
+```python
+"""Tests for AgentExecutor."""
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime
+
+from claude_agent_sdk.executor import AgentExecutor, ClaudeAgentOptions
+from claude_agent_sdk.models import SessionState, SessionMetadata, Message
+from claude_agent_sdk.protocols import SessionStore
+
+
+class MockSessionStore:
+    """Mock SessionStore for testing."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.messages = {}
+
+    async def create_session(self, session_id: str, metadata: SessionMetadata):
+        self.sessions[session_id] = metadata
+        self.messages[session_id] = []
+
+    async def load_session(self, session_id: str) -> SessionState | None:
+        if session_id not in self.sessions:
+            return None
+
+        return SessionState(
+            session_id=session_id,
+            messages=self.messages.get(session_id, []),
+            metadata=self.sessions[session_id],
+            created_at=datetime.now(),
+            updated_at=datetime.now()
+        )
+
+    async def append_message(self, session_id: str, message: Message):
+        if session_id not in self.messages:
+            self.messages[session_id] = []
+        self.messages[session_id].append(message)
+
+    async def update_metadata(self, session_id: str, metadata: SessionMetadata):
+        self.sessions[session_id] = metadata
+
+    async def session_exists(self, session_id: str) -> bool:
+        return session_id in self.sessions
+
+    async def get_messages(self, session_id: str, from_turn: int = 0, to_turn: int | None = None):
+        return self.messages.get(session_id, [])[from_turn:to_turn]
+
+    async def delete_session(self, session_id: str):
+        self.sessions.pop(session_id, None)
+        self.messages.pop(session_id, None)
+
+    async def fork_session(self, source_session_id: str, new_session_id: str):
+        pass
+
+    async def compact_session(self, session_id: str, compaction_state):
+        pass
+
+    async def list_sessions(self, working_directory: str | None = None, limit: int = 100):
+        return list(self.sessions.keys())
+
+    async def close(self):
+        pass
+
+
+class MockAnthropicMessage:
+    """Mock streaming event from Anthropic API."""
+
+    def __init__(self, event_type: str, **kwargs):
+        self.type = event_type
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class MockTextBlock:
+    """Mock text content block."""
+    def __init__(self):
+        self.type = "text"
+
+
+class MockTextDelta:
+    """Mock text delta."""
+    def __init__(self, text: str):
+        self.type = "text_delta"
+        self.text = text
+
+
+@pytest.fixture
+def mock_store():
+    """Create a mock session store."""
+    return MockSessionStore()
+
+
+@pytest.fixture
+def mock_anthropic_client():
+    """Create a mock Anthropic client."""
+    client = AsyncMock()
+    return client
+
+
+@pytest.fixture
+def executor(mock_store, mock_anthropic_client):
+    """Create an AgentExecutor for testing."""
+    options = ClaudeAgentOptions(
+        model="claude-sonnet-4-5-20250929",
+        max_turns=10
+    )
+    return AgentExecutor(
+        session_store=mock_store,
+        anthropic_client=mock_anthropic_client,
+        options=options
+    )
+
+
+@pytest.mark.asyncio
+async def test_initialize_new_session(executor, mock_store):
+    """Test that executor initializes a new session if it doesn't exist."""
+    session_id = "new-session"
+
+    # Session shouldn't exist yet
+    assert not await mock_store.session_exists(session_id)
+
+    # Mock the Anthropic API response
+    mock_stream = [
+        MockAnthropicMessage("content_block_start", content_block=MockTextBlock()),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta("Hello")),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta(" there!")),
+        MockAnthropicMessage("message_stop"),
+    ]
+
+    executor.client.messages.create = AsyncMock()
+    executor.client.messages.create.return_value = async_generator_from_list(mock_stream)
+
+    # Execute turn
+    messages = []
+    async for msg in executor.execute_turn(session_id, "Hi"):
+        messages.append(msg)
+
+    # Verify session was created
+    assert await mock_store.session_exists(session_id)
+
+    # Verify messages were persisted
+    assert len(messages) == 2  # user + assistant
+    assert messages[0].role == "user"
+    assert messages[1].role == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_execute_basic_turn(executor, mock_store):
+    """Test executing a basic single turn."""
+    session_id = "test-session"
+
+    # Mock Anthropic API
+    mock_stream = [
+        MockAnthropicMessage("content_block_start", content_block=MockTextBlock()),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta("Response")),
+        MockAnthropicMessage("message_stop"),
+    ]
+
+    executor.client.messages.create = AsyncMock()
+    executor.client.messages.create.return_value = async_generator_from_list(mock_stream)
+
+    # Execute turn
+    messages = []
+    async for msg in executor.execute_turn(session_id, "Test message"):
+        messages.append(msg)
+
+    # Verify messages
+    assert len(messages) == 2
+    assert messages[0].role == "user"
+    assert messages[0].content == "Test message"
+    assert messages[1].role == "assistant"
+    assert messages[1].content[0]["text"] == "Response"
+
+
+@pytest.mark.asyncio
+async def test_messages_persisted_to_store(executor, mock_store):
+    """Test that all messages are persisted to the session store."""
+    session_id = "persist-test"
+
+    # Mock API
+    mock_stream = [
+        MockAnthropicMessage("content_block_start", content_block=MockTextBlock()),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta("OK")),
+        MockAnthropicMessage("message_stop"),
+    ]
+    executor.client.messages.create = AsyncMock()
+    executor.client.messages.create.return_value = async_generator_from_list(mock_stream)
+
+    # Execute turn
+    async for _ in executor.execute_turn(session_id, "Hello"):
+        pass
+
+    # Load session and check messages
+    session = await mock_store.load_session(session_id)
+    assert len(session.messages) == 2
+    assert session.messages[0].role == "user"
+    assert session.messages[1].role == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_metadata_updated_after_turn(executor, mock_store):
+    """Test that metadata is updated after each turn."""
+    session_id = "metadata-test"
+
+    # Mock API
+    mock_stream = [
+        MockAnthropicMessage("content_block_start", content_block=MockTextBlock()),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta("Reply")),
+        MockAnthropicMessage("message_stop"),
+    ]
+    executor.client.messages.create = AsyncMock()
+    executor.client.messages.create.return_value = async_generator_from_list(mock_stream)
+
+    # Execute turn
+    async for _ in executor.execute_turn(session_id, "Message"):
+        pass
+
+    # Check metadata
+    session = await mock_store.load_session(session_id)
+    assert session.metadata.num_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_existing_session(executor, mock_store):
+    """Test resuming an existing session."""
+    session_id = "resume-test"
+
+    # Create initial session
+    metadata = SessionMetadata(num_turns=0)
+    await mock_store.create_session(session_id, metadata)
+
+    # Add initial message
+    first_msg = Message(role="user", content="First", id="m1")
+    await mock_store.append_message(session_id, first_msg)
+
+    # Mock API for second turn
+    mock_stream = [
+        MockAnthropicMessage("content_block_start", content_block=MockTextBlock()),
+        MockAnthropicMessage("content_block_delta", delta=MockTextDelta("Second response")),
+        MockAnthropicMessage("message_stop"),
+    ]
+    executor.client.messages.create = AsyncMock()
+    executor.client.messages.create.return_value = async_generator_from_list(mock_stream)
+
+    # Execute second turn
+    async for _ in executor.execute_turn(session_id, "Second message"):
+        pass
+
+    # Verify session has both conversations
+    session = await mock_store.load_session(session_id)
+    # Should have: first user, second user, second assistant
+    assert len(session.messages) >= 2
+
+
+@pytest.mark.asyncio
+async def test_max_turns_limit(executor, mock_store):
+    """Test that execution stops at max turns limit."""
+    session_id = "max-turns-test"
+
+    # Create session at max turns
+    metadata = SessionMetadata(num_turns=10)  # executor max_turns is 10
+    await mock_store.create_session(session_id, metadata)
+
+    # Try to execute another turn
+    messages = []
+    async for msg in executor.execute_turn(session_id, "This should not execute"):
+        messages.append(msg)
+
+    # Should not execute (no messages)
+    assert len(messages) == 0
+
+
+def async_generator_from_list(items):
+    """Helper to create async generator from list."""
+    async def _gen():
+        for item in items:
+            yield item
+    return _gen()
+```
+
+3. **Run the executor tests**:
+   ```bash
+   pytest tests/test_executor.py -v --cov=src/claude_agent_sdk/executor
+   ```
+
+4. **Update `src/claude_agent_sdk/__init__.py`** to export executor components:
+   ```python
+   from claude_agent_sdk.executor import AgentExecutor, ClaudeAgentOptions
+
+   __all__ = [
+       # ... existing exports ...
+       "AgentExecutor",
+       "ClaudeAgentOptions",
+   ]
+   ```
+
+Ensure all tests pass and the executor correctly executes single turns in a stateless manner.
+</prompt>
+
+---
+
