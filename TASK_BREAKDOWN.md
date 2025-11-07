@@ -1389,3 +1389,886 @@ Ensure all tests pass with 100% coverage of the serialization module.
 
 ---
 
+### 🔄 **Iteration 2: File-Based Storage Implementation**
+
+This iteration implements the FileSessionStore, which provides file-based persistence using JSONL format. This is the default storage backend and must maintain 100% backward compatibility with existing SDK behavior.
+
+---
+
+#### Task 5: Implement FileSessionStore Basic Operations
+
+Status: **Pending**
+
+**Goal**: Implement the core FileSessionStore class with session creation, message appending, and loading functionality using JSONL format with proper file locking for concurrent access safety.
+
+**Working Result**: A working **FileSessionStore** class in `src/claude_agent_sdk/stores/file_store.py` that can create sessions, append messages atomically to JSONL files, and load complete session state from disk. All operations are thread-safe using asyncio locks.
+
+**Validation**:
+- [ ] `FileSessionStore` class exists in `src/claude_agent_sdk/stores/file_store.py`
+- [ ] `__init__` accepts `base_path` parameter (defaults to `~/.claude`)
+- [ ] `create_session()` creates directory structure and writes initial metadata
+- [ ] `append_message()` appends single JSON line atomically to `.jsonl` file
+- [ ] `load_session()` reads JSONL file and reconstructs SessionState
+- [ ] `session_exists()` checks if session file exists without loading it
+- [ ] Unit tests in `tests/stores/test_file_store.py` verify basic operations
+- [ ] `pytest tests/stores/test_file_store.py::test_create_and_load_session -v` passes
+
+<prompt>
+You are implementing the FileSessionStore, the default storage backend for the Stateless Claude Agent SDK. This store uses JSONL (JSON Lines) format where each message is a single line in a file.
+
+1. **Create `src/claude_agent_sdk/stores/__init__.py`** to make it a package:
+   ```python
+   """Storage backend implementations."""
+
+   from claude_agent_sdk.stores.file_store import FileSessionStore
+
+   __all__ = ["FileSessionStore"]
+   ```
+
+2. **Create `src/claude_agent_sdk/stores/file_store.py`** with the following implementation:
+
+```python
+"""File-based session storage using JSONL format."""
+
+import json
+import asyncio
+import aiofiles
+from pathlib import Path
+from datetime import datetime
+from typing import Dict
+from claude_agent_sdk.protocols import (
+    SessionStore,
+    SessionNotFoundError,
+    StorageError,
+)
+from claude_agent_sdk.models import (
+    SessionState,
+    SessionMetadata,
+    Message,
+    CompactionState,
+)
+from claude_agent_sdk.serialization import (
+    serialize_message,
+    deserialize_message,
+)
+
+
+class FileSessionStore:
+    """
+    File-based storage using JSONL format.
+
+    100% compatible with existing SDK behavior. Each session is stored
+    as a .jsonl file with one message per line. Session metadata is stored
+    as a special line in the file.
+
+    Thread-safe using asyncio locks per session.
+    """
+
+    def __init__(self, base_path: Path | str | None = None):
+        """
+        Initialize file store.
+
+        Args:
+            base_path: Root directory for session storage.
+                      Defaults to ~/.claude
+        """
+        if base_path is None:
+            base_path = Path.home() / ".claude"
+        self.base_path = Path(base_path)
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_session_path(self, session_id: str) -> Path:
+        """
+        Convert session ID to file path.
+
+        Encodes session ID to be filesystem-safe and maintains
+        compatibility with existing path structure.
+        """
+        # Encode session ID for filesystem (replace problematic chars)
+        encoded = session_id.replace("/", "-").replace("\\", "-")
+        # Store in projects subdirectory
+        session_dir = self.base_path / "projects" / encoded
+        return session_dir / f"{encoded}.jsonl"
+
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create a lock for a session."""
+        if session_id not in self._locks:
+            self._locks[session_id] = asyncio.Lock()
+        return self._locks[session_id]
+
+    async def create_session(
+        self,
+        session_id: str,
+        metadata: SessionMetadata
+    ) -> None:
+        """
+        Initialize a new session with metadata.
+
+        Creates the session directory and writes initial metadata line.
+        """
+        path = self._get_session_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock = self._get_lock(session_id)
+
+        async with lock:
+            try:
+                # Write metadata as first line
+                metadata_entry = {
+                    "type": "metadata",
+                    "data": metadata.to_dict(),
+                    "timestamp": datetime.now().isoformat(),
+                }
+                line = json.dumps(metadata_entry, ensure_ascii=False) + "\n"
+
+                async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                    await f.write(line)
+            except Exception as e:
+                raise StorageError(f"Failed to create session {session_id}: {e}") from e
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: Message
+    ) -> None:
+        """
+        Append a single message to session history.
+
+        Atomically appends one JSON line to the JSONL file.
+        """
+        path = self._get_session_path(session_id)
+
+        if not path.exists():
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        lock = self._get_lock(session_id)
+
+        async with lock:
+            try:
+                # Serialize message
+                msg_data = serialize_message(message)
+                msg_entry = {
+                    "type": "message",
+                    "data": msg_data,
+                }
+                line = json.dumps(msg_entry, ensure_ascii=False) + "\n"
+
+                # Atomic append
+                async with aiofiles.open(path, "a", encoding="utf-8") as f:
+                    await f.write(line)
+            except SessionNotFoundError:
+                raise
+            except Exception as e:
+                raise StorageError(f"Failed to append message to {session_id}: {e}") from e
+
+    async def load_session(
+        self,
+        session_id: str
+    ) -> SessionState | None:
+        """
+        Load complete session state.
+
+        Parses the JSONL file to reconstruct full session state.
+        """
+        path = self._get_session_path(session_id)
+
+        if not path.exists():
+            return None
+
+        lock = self._get_lock(session_id)
+
+        async with lock:
+            try:
+                messages = []
+                metadata = None
+
+                async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                    async for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        entry = json.loads(line)
+
+                        if entry.get("type") == "metadata":
+                            metadata = SessionMetadata.from_dict(entry["data"])
+                        elif entry.get("type") == "message":
+                            msg = deserialize_message(entry["data"])
+                            messages.append(msg)
+
+                # Get file timestamps
+                stat = path.stat()
+                created_at = datetime.fromtimestamp(stat.st_ctime)
+                updated_at = datetime.fromtimestamp(stat.st_mtime)
+
+                # Use default metadata if none found
+                if metadata is None:
+                    metadata = SessionMetadata()
+
+                return SessionState(
+                    session_id=session_id,
+                    messages=messages,
+                    metadata=metadata,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            except Exception as e:
+                raise StorageError(f"Failed to load session {session_id}: {e}") from e
+
+    async def session_exists(
+        self,
+        session_id: str
+    ) -> bool:
+        """
+        Check if session exists without loading full state.
+
+        Lightweight existence check.
+        """
+        path = self._get_session_path(session_id)
+        return path.exists()
+
+    async def update_metadata(
+        self,
+        session_id: str,
+        metadata: SessionMetadata
+    ) -> None:
+        """
+        Update session metadata.
+
+        Rewrites the metadata line in the JSONL file.
+        For file store, we need to rewrite the entire file.
+        """
+        # Load current session
+        session = await self.load_session(session_id)
+        if session is None:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        # Update metadata
+        session.metadata = metadata
+
+        # Rewrite file with new metadata
+        path = self._get_session_path(session_id)
+        lock = self._get_lock(session_id)
+
+        async with lock:
+            try:
+                # Write to temporary file first
+                temp_path = path.with_suffix(".jsonl.tmp")
+
+                async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+                    # Write metadata
+                    metadata_entry = {
+                        "type": "metadata",
+                        "data": metadata.to_dict(),
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    await f.write(json.dumps(metadata_entry, ensure_ascii=False) + "\n")
+
+                    # Write all messages
+                    for msg in session.messages:
+                        msg_entry = {
+                            "type": "message",
+                            "data": serialize_message(msg),
+                        }
+                        await f.write(json.dumps(msg_entry, ensure_ascii=False) + "\n")
+
+                # Atomic replace
+                temp_path.replace(path)
+            except Exception as e:
+                raise StorageError(f"Failed to update metadata for {session_id}: {e}") from e
+
+    async def close(self) -> None:
+        """Clean up resources."""
+        # Clear locks
+        self._locks.clear()
+```
+
+3. **Create unit tests** in `tests/stores/test_file_store.py`:
+
+```python
+"""Tests for FileSessionStore."""
+
+import pytest
+import asyncio
+from pathlib import Path
+from datetime import datetime
+from claude_agent_sdk.stores.file_store import FileSessionStore
+from claude_agent_sdk.models import SessionMetadata, Message
+from claude_agent_sdk.protocols import SessionNotFoundError, StorageError
+
+
+@pytest.fixture
+def temp_store_path(tmp_path):
+    """Create a temporary directory for file store tests."""
+    return tmp_path / "test_store"
+
+
+@pytest.fixture
+def file_store(temp_store_path):
+    """Create a FileSessionStore instance for testing."""
+    return FileSessionStore(base_path=temp_store_path)
+
+
+@pytest.mark.asyncio
+async def test_create_session(file_store, temp_store_path):
+    """Test creating a new session."""
+    session_id = "test-session-1"
+    metadata = SessionMetadata(model="claude-sonnet-4-5-20250929")
+
+    await file_store.create_session(session_id, metadata)
+
+    # Verify file was created
+    session_path = file_store._get_session_path(session_id)
+    assert session_path.exists()
+
+    # Verify directory structure
+    assert session_path.parent.exists()
+    assert "test-session-1" in str(session_path)
+
+
+@pytest.mark.asyncio
+async def test_session_exists(file_store):
+    """Test checking if a session exists."""
+    session_id = "exists-test"
+    metadata = SessionMetadata()
+
+    # Should not exist initially
+    assert not await file_store.session_exists(session_id)
+
+    # Create session
+    await file_store.create_session(session_id, metadata)
+
+    # Should exist now
+    assert await file_store.session_exists(session_id)
+
+
+@pytest.mark.asyncio
+async def test_append_message(file_store):
+    """Test appending a message to a session."""
+    session_id = "append-test"
+    metadata = SessionMetadata()
+
+    # Create session
+    await file_store.create_session(session_id, metadata)
+
+    # Append message
+    msg = Message(role="user", content="Hello!", id="msg-1")
+    await file_store.append_message(session_id, msg)
+
+    # Verify message was appended
+    session_path = file_store._get_session_path(session_id)
+    content = session_path.read_text()
+    assert "Hello!" in content
+    assert "msg-1" in content
+
+
+@pytest.mark.asyncio
+async def test_append_message_to_nonexistent_session(file_store):
+    """Test that appending to nonexistent session raises error."""
+    msg = Message(role="user", content="Test")
+
+    with pytest.raises(SessionNotFoundError):
+        await file_store.append_message("nonexistent", msg)
+
+
+@pytest.mark.asyncio
+async def test_load_session(file_store):
+    """Test loading a complete session."""
+    session_id = "load-test"
+    metadata = SessionMetadata(model="claude-opus-4", num_turns=2)
+
+    # Create session
+    await file_store.create_session(session_id, metadata)
+
+    # Append messages
+    msg1 = Message(role="user", content="First message", id="m1")
+    msg2 = Message(role="assistant", content="Second message", id="m2")
+    await file_store.append_message(session_id, msg1)
+    await file_store.append_message(session_id, msg2)
+
+    # Load session
+    session = await file_store.load_session(session_id)
+
+    assert session is not None
+    assert session.session_id == session_id
+    assert len(session.messages) == 2
+    assert session.messages[0].content == "First message"
+    assert session.messages[1].content == "Second message"
+    assert session.metadata.model == "claude-opus-4"
+    assert session.metadata.num_turns == 2
+
+
+@pytest.mark.asyncio
+async def test_load_nonexistent_session(file_store):
+    """Test that loading nonexistent session returns None."""
+    session = await file_store.load_session("does-not-exist")
+    assert session is None
+
+
+@pytest.mark.asyncio
+async def test_update_metadata(file_store):
+    """Test updating session metadata."""
+    session_id = "metadata-test"
+    metadata = SessionMetadata(num_turns=0, total_cost_usd=0.0)
+
+    # Create session
+    await file_store.create_session(session_id, metadata)
+
+    # Append a message
+    await file_store.append_message(
+        session_id,
+        Message(role="user", content="Test", id="m1")
+    )
+
+    # Update metadata
+    updated_metadata = SessionMetadata(num_turns=1, total_cost_usd=0.05)
+    await file_store.update_metadata(session_id, updated_metadata)
+
+    # Load and verify
+    session = await file_store.load_session(session_id)
+    assert session.metadata.num_turns == 1
+    assert session.metadata.total_cost_usd == 0.05
+    # Message should still be there
+    assert len(session.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_appends(file_store):
+    """Test that concurrent message appends are thread-safe."""
+    session_id = "concurrent-test"
+    metadata = SessionMetadata()
+
+    await file_store.create_session(session_id, metadata)
+
+    # Append multiple messages concurrently
+    messages = [
+        Message(role="user", content=f"Message {i}", id=f"msg-{i}")
+        for i in range(10)
+    ]
+
+    await asyncio.gather(
+        *[file_store.append_message(session_id, msg) for msg in messages]
+    )
+
+    # Load and verify all messages were saved
+    session = await file_store.load_session(session_id)
+    assert len(session.messages) == 10
+
+
+@pytest.mark.asyncio
+async def test_close(file_store):
+    """Test cleanup of resources."""
+    # Create some sessions
+    await file_store.create_session("session1", SessionMetadata())
+    await file_store.create_session("session2", SessionMetadata())
+
+    # Close should clear locks
+    await file_store.close()
+    assert len(file_store._locks) == 0
+```
+
+4. **Run the tests**:
+   ```bash
+   pytest tests/stores/test_file_store.py -v --cov=src/claude_agent_sdk/stores/file_store
+   ```
+
+5. **Update `src/claude_agent_sdk/__init__.py`** to export FileSessionStore:
+   ```python
+   from claude_agent_sdk.stores import FileSessionStore
+
+   __all__ = [
+       # ... existing exports ...
+       "FileSessionStore",
+   ]
+   ```
+
+Ensure all tests pass and the file store correctly implements the SessionStore protocol.
+</prompt>
+
+---
+
+#### Task 6: Implement FileSessionStore Advanced Operations
+
+Status: **Pending**
+
+**Goal**: Complete the FileSessionStore implementation by adding advanced operations: session listing, deletion, forking, and context compaction support.
+
+**Working Result**: A fully functional FileSessionStore with all SessionStore protocol methods implemented, including `list_sessions()`, `delete_session()`, `fork_session()`, `compact_session()`, and `get_messages()` with range support.
+
+**Validation**:
+- [ ] `list_sessions()` lists all session IDs, optionally filtered by working directory
+- [ ] `delete_session()` removes session file and cleans up directory if empty
+- [ ] `fork_session()` creates a complete copy of a session with new ID
+- [ ] `compact_session()` applies compaction and updates metadata
+- [ ] `get_messages()` returns message subrange based on turn numbers
+- [ ] All methods raise appropriate exceptions for error cases
+- [ ] Unit tests in `tests/stores/test_file_store.py` cover all new operations
+- [ ] `pytest tests/stores/test_file_store.py -v` passes with >95% coverage
+
+<prompt>
+You are completing the FileSessionStore implementation by adding advanced operations for session management and context windowing.
+
+1. **Add the following methods to `src/claude_agent_sdk/stores/file_store.py`**:
+
+```python
+    async def get_messages(
+        self,
+        session_id: str,
+        from_turn: int = 0,
+        to_turn: int | None = None
+    ) -> list[Message]:
+        """
+        Retrieve message history with optional range.
+
+        Useful for pagination and context windowing.
+        """
+        session = await self.load_session(session_id)
+        if session is None:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        messages = session.messages
+
+        if to_turn is None:
+            return messages[from_turn:]
+        else:
+            return messages[from_turn:to_turn]
+
+    async def list_sessions(
+        self,
+        working_directory: str | None = None,
+        limit: int = 100
+    ) -> list[str]:
+        """
+        List session IDs, optionally filtered by working directory.
+
+        Returns most recently modified sessions first.
+        """
+        try:
+            projects_dir = self.base_path / "projects"
+            if not projects_dir.exists():
+                return []
+
+            # Find all .jsonl files
+            session_files = []
+            for path in projects_dir.rglob("*.jsonl"):
+                # Extract session ID from filename
+                session_id = path.stem  # filename without .jsonl extension
+
+                # Filter by working directory if specified
+                if working_directory is not None:
+                    # Load session to check working directory
+                    session = await self.load_session(session_id)
+                    if session and session.metadata.working_directory == working_directory:
+                        session_files.append((path.stat().st_mtime, session_id))
+                else:
+                    session_files.append((path.stat().st_mtime, session_id))
+
+            # Sort by modification time (most recent first)
+            session_files.sort(reverse=True, key=lambda x: x[0])
+
+            # Return session IDs only, up to limit
+            return [session_id for _, session_id in session_files[:limit]]
+        except Exception as e:
+            raise StorageError(f"Failed to list sessions: {e}") from e
+
+    async def delete_session(
+        self,
+        session_id: str
+    ) -> None:
+        """
+        Permanently delete a session.
+
+        Removes the session file and cleans up empty directories.
+        """
+        path = self._get_session_path(session_id)
+
+        if not path.exists():
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        lock = self._get_lock(session_id)
+
+        async with lock:
+            try:
+                # Delete the file
+                path.unlink()
+
+                # Clean up empty parent directory
+                parent = path.parent
+                if parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+
+                # Remove lock
+                if session_id in self._locks:
+                    del self._locks[session_id]
+            except Exception as e:
+                raise StorageError(f"Failed to delete session {session_id}: {e}") from e
+
+    async def fork_session(
+        self,
+        source_session_id: str,
+        new_session_id: str
+    ) -> None:
+        """
+        Create a copy of a session with a new ID.
+
+        Used for session branching.
+        """
+        # Load source session
+        source_session = await self.load_session(source_session_id)
+        if source_session is None:
+            raise SessionNotFoundError(f"Source session {source_session_id} does not exist")
+
+        # Create new session with same metadata
+        await self.create_session(new_session_id, source_session.metadata)
+
+        # Copy all messages
+        for message in source_session.messages:
+            await self.append_message(new_session_id, message)
+
+    async def compact_session(
+        self,
+        session_id: str,
+        compaction_state: CompactionState
+    ) -> None:
+        """
+        Apply context compaction to session.
+
+        Replaces compacted messages with a summary and updates metadata.
+        This is a simplified implementation - real compaction would
+        remove specific message ranges.
+        """
+        session = await self.load_session(session_id)
+        if session is None:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        # Update metadata with compaction state
+        session.metadata.compaction_state = compaction_state
+
+        # Update the session metadata
+        await self.update_metadata(session_id, session.metadata)
+```
+
+2. **Add comprehensive tests for advanced operations** in `tests/stores/test_file_store.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_get_messages_full_range(file_store):
+    """Test getting all messages from a session."""
+    session_id = "messages-test"
+    await file_store.create_session(session_id, SessionMetadata())
+
+    # Add several messages
+    for i in range(5):
+        await file_store.append_message(
+            session_id,
+            Message(role="user", content=f"Message {i}", id=f"m{i}")
+        )
+
+    messages = await file_store.get_messages(session_id)
+    assert len(messages) == 5
+    assert messages[0].content == "Message 0"
+    assert messages[4].content == "Message 4"
+
+
+@pytest.mark.asyncio
+async def test_get_messages_with_range(file_store):
+    """Test getting a subset of messages."""
+    session_id = "range-test"
+    await file_store.create_session(session_id, SessionMetadata())
+
+    for i in range(10):
+        await file_store.append_message(
+            session_id,
+            Message(role="user", content=f"Msg {i}", id=f"m{i}")
+        )
+
+    # Get messages 3-7
+    messages = await file_store.get_messages(session_id, from_turn=3, to_turn=7)
+    assert len(messages) == 4
+    assert messages[0].content == "Msg 3"
+    assert messages[3].content == "Msg 6"
+
+
+@pytest.mark.asyncio
+async def test_get_messages_from_turn(file_store):
+    """Test getting messages from a specific turn onwards."""
+    session_id = "from-turn-test"
+    await file_store.create_session(session_id, SessionMetadata())
+
+    for i in range(5):
+        await file_store.append_message(
+            session_id,
+            Message(role="user", content=f"Msg {i}", id=f"m{i}")
+        )
+
+    messages = await file_store.get_messages(session_id, from_turn=3)
+    assert len(messages) == 2
+    assert messages[0].content == "Msg 3"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions(file_store):
+    """Test listing all sessions."""
+    # Create multiple sessions
+    for i in range(3):
+        await file_store.create_session(f"session-{i}", SessionMetadata())
+
+    sessions = await file_store.list_sessions()
+    assert len(sessions) == 3
+    assert "session-0" in sessions
+    assert "session-1" in sessions
+    assert "session-2" in sessions
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_empty(file_store):
+    """Test listing when no sessions exist."""
+    sessions = await file_store.list_sessions()
+    assert sessions == []
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_with_limit(file_store):
+    """Test listing sessions with a limit."""
+    # Create many sessions
+    for i in range(10):
+        await file_store.create_session(f"session-{i}", SessionMetadata())
+        await asyncio.sleep(0.01)  # Ensure different mtimes
+
+    sessions = await file_store.list_sessions(limit=5)
+    assert len(sessions) == 5
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_working_directory(file_store):
+    """Test filtering sessions by working directory."""
+    # Create sessions in different directories
+    metadata1 = SessionMetadata(working_directory="/tmp/project1")
+    metadata2 = SessionMetadata(working_directory="/tmp/project2")
+
+    await file_store.create_session("session-1", metadata1)
+    await file_store.create_session("session-2", metadata2)
+    await file_store.create_session("session-3", metadata1)
+
+    # List sessions in project1
+    sessions = await file_store.list_sessions(working_directory="/tmp/project1")
+    assert len(sessions) == 2
+    assert "session-1" in sessions
+    assert "session-3" in sessions
+
+
+@pytest.mark.asyncio
+async def test_delete_session(file_store):
+    """Test deleting a session."""
+    session_id = "delete-test"
+    await file_store.create_session(session_id, SessionMetadata())
+
+    # Verify exists
+    assert await file_store.session_exists(session_id)
+
+    # Delete
+    await file_store.delete_session(session_id)
+
+    # Verify gone
+    assert not await file_store.session_exists(session_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_nonexistent_session(file_store):
+    """Test that deleting nonexistent session raises error."""
+    with pytest.raises(SessionNotFoundError):
+        await file_store.delete_session("does-not-exist")
+
+
+@pytest.mark.asyncio
+async def test_fork_session(file_store):
+    """Test forking a session to create a copy."""
+    source_id = "source-session"
+    fork_id = "forked-session"
+
+    # Create source session with messages
+    metadata = SessionMetadata(model="claude-opus-4", num_turns=2)
+    await file_store.create_session(source_id, metadata)
+    await file_store.append_message(
+        source_id,
+        Message(role="user", content="Original message", id="m1")
+    )
+
+    # Fork the session
+    await file_store.fork_session(source_id, fork_id)
+
+    # Verify fork exists and has same content
+    fork_session = await file_store.load_session(fork_id)
+    assert fork_session is not None
+    assert fork_session.session_id == fork_id
+    assert len(fork_session.messages) == 1
+    assert fork_session.messages[0].content == "Original message"
+    assert fork_session.metadata.model == "claude-opus-4"
+
+    # Verify source still exists unchanged
+    source_session = await file_store.load_session(source_id)
+    assert source_session is not None
+
+
+@pytest.mark.asyncio
+async def test_fork_nonexistent_session(file_store):
+    """Test that forking nonexistent session raises error."""
+    with pytest.raises(SessionNotFoundError):
+        await file_store.fork_session("nonexistent", "new-fork")
+
+
+@pytest.mark.asyncio
+async def test_compact_session(file_store):
+    """Test applying context compaction to a session."""
+    from claude_agent_sdk.models import CompactionState
+
+    session_id = "compact-test"
+    metadata = SessionMetadata()
+    await file_store.create_session(session_id, metadata)
+
+    # Add messages
+    for i in range(5):
+        await file_store.append_message(
+            session_id,
+            Message(role="user", content=f"Msg {i}", id=f"m{i}")
+        )
+
+    # Apply compaction
+    compaction = CompactionState(
+        last_compaction_turn=3,
+        summary="Summary of messages 0-2",
+        original_message_ids=["m0", "m1", "m2"]
+    )
+    await file_store.compact_session(session_id, compaction)
+
+    # Verify compaction state was saved
+    session = await file_store.load_session(session_id)
+    assert session.metadata.compaction_state is not None
+    assert session.metadata.compaction_state.last_compaction_turn == 3
+    assert "Summary" in session.metadata.compaction_state.summary
+
+
+@pytest.mark.asyncio
+async def test_protocol_compliance(file_store):
+    """Test that FileSessionStore satisfies SessionStore protocol."""
+    from claude_agent_sdk.protocols import SessionStore
+
+    # FileSessionStore should satisfy the protocol
+    assert isinstance(file_store, SessionStore)
+```
+
+3. **Run all file store tests**:
+   ```bash
+   pytest tests/stores/test_file_store.py -v --cov=src/claude_agent_sdk/stores/file_store --cov-report=term-missing
+   ```
+
+4. **Verify protocol compliance**:
+   ```bash
+   mypy src/claude_agent_sdk/stores/file_store.py --strict
+   ```
+
+Ensure all tests pass with high coverage and the FileSessionStore fully implements the SessionStore protocol.
+</prompt>
+
+---
+
