@@ -2272,3 +2272,944 @@ Ensure all tests pass with high coverage and the FileSessionStore fully implemen
 
 ---
 
+### 🔄 **Iteration 3: Redis Storage Backend**
+
+This iteration implements the RedisSessionStore for distributed and stateless deployments. Redis provides fast, in-memory storage with built-in TTL support, perfect for horizontally-scaled agent systems.
+
+---
+
+#### Task 7: Implement RedisSessionStore Basic Operations
+
+Status: **Pending**
+
+**Goal**: Implement a Redis-based storage backend using Redis lists for messages and hashes for metadata, supporting distributed agent deployments with automatic session expiration.
+
+**Working Result**: A working **RedisSessionStore** class in `src/claude_agent_sdk/stores/redis_store.py` that stores messages in Redis lists, metadata in Redis hashes, and supports configurable TTL for automatic session cleanup.
+
+**Validation**:
+- [ ] `RedisSessionStore` class exists in `src/claude_agent_sdk/stores/redis_store.py`
+- [ ] `__init__` accepts `redis_url` parameter (defaults to `redis://localhost:6379`)
+- [ ] Uses Redis data structures: `session:{id}:messages` (list), `session:{id}:metadata` (hash)
+- [ ] `create_session()` initializes metadata hash and created_at timestamp
+- [ ] `append_message()` uses RPUSH to append to message list atomically
+- [ ] `load_session()` loads messages from list and metadata from hash
+- [ ] All session keys have configurable TTL (default 30 days)
+- [ ] Unit tests use fakeredis for testing without actual Redis server
+- [ ] `pytest tests/stores/test_redis_store.py -v` passes
+
+<prompt>
+You are implementing the RedisSessionStore for distributed, stateless agent deployments. This store uses Redis as a fast, shared storage backend.
+
+1. **Install redis dependency** - Ensure `redis[hiredis]>=5.0.0` is in pyproject.toml dependencies.
+
+2. **Create `src/claude_agent_sdk/stores/redis_store.py`** with the following implementation:
+
+```python
+"""Redis-based session storage for distributed deployments."""
+
+import json
+from datetime import datetime, timedelta
+from typing import Optional
+import redis.asyncio as redis
+from claude_agent_sdk.protocols import (
+    SessionStore,
+    SessionNotFoundError,
+    StorageError,
+)
+from claude_agent_sdk.models import (
+    SessionState,
+    SessionMetadata,
+    Message,
+    CompactionState,
+)
+from claude_agent_sdk.serialization import (
+    serialize_message,
+    deserialize_message,
+)
+
+
+class RedisSessionStore:
+    """
+    Redis-based storage for distributed/stateless deployments.
+
+    Schema:
+    - session:{session_id}:messages -> List of JSON messages (RPUSH)
+    - session:{session_id}:metadata -> Hash of metadata fields
+    - session:{session_id}:created_at -> Timestamp string
+    - sessions_by_dir:{working_dir} -> Set of session IDs (for filtering)
+
+    All keys have TTL for automatic cleanup.
+    """
+
+    def __init__(
+        self,
+        redis_url: str = "redis://localhost:6379",
+        default_ttl_days: int = 30
+    ):
+        """
+        Initialize Redis store.
+
+        Args:
+            redis_url: Redis connection URL
+            default_ttl_days: Default TTL for sessions in days
+        """
+        self.redis_url = redis_url
+        self.redis: Optional[redis.Redis] = None
+        self.default_ttl = timedelta(days=default_ttl_days)
+
+    async def _ensure_connected(self):
+        """Ensure Redis connection is established."""
+        if self.redis is None:
+            self.redis = await redis.from_url(
+                self.redis_url,
+                encoding="utf-8",
+                decode_responses=True
+            )
+
+    def _message_key(self, session_id: str) -> str:
+        """Get Redis key for message list."""
+        return f"session:{session_id}:messages"
+
+    def _metadata_key(self, session_id: str) -> str:
+        """Get Redis key for metadata hash."""
+        return f"session:{session_id}:metadata"
+
+    def _created_at_key(self, session_id: str) -> str:
+        """Get Redis key for created_at timestamp."""
+        return f"session:{session_id}:created_at"
+
+    def _directory_set_key(self, working_directory: str) -> str:
+        """Get Redis key for directory-based session index."""
+        return f"sessions_by_dir:{working_directory}"
+
+    async def create_session(
+        self,
+        session_id: str,
+        metadata: SessionMetadata
+    ) -> None:
+        """
+        Initialize a new session with metadata.
+
+        Creates metadata hash and sets up indexes.
+        """
+        await self._ensure_connected()
+
+        try:
+            # Serialize metadata
+            metadata_dict = metadata.to_dict()
+
+            # Store metadata as hash
+            metadata_key = self._metadata_key(session_id)
+            await self.redis.hset(metadata_key, mapping=metadata_dict)
+
+            # Set created_at timestamp
+            created_at_key = self._created_at_key(session_id)
+            await self.redis.set(created_at_key, datetime.now().isoformat())
+
+            # Initialize empty message list (creates the key)
+            message_key = self._message_key(session_id)
+            await self.redis.lpush(message_key, "__init__")
+            await self.redis.lpop(message_key)  # Remove init marker
+
+            # Add to directory index
+            dir_key = self._directory_set_key(metadata.working_directory)
+            await self.redis.sadd(dir_key, session_id)
+
+            # Set TTL on all keys
+            ttl_seconds = int(self.default_ttl.total_seconds())
+            await self.redis.expire(metadata_key, ttl_seconds)
+            await self.redis.expire(created_at_key, ttl_seconds)
+            await self.redis.expire(message_key, ttl_seconds)
+            await self.redis.expire(dir_key, ttl_seconds)
+
+        except Exception as e:
+            raise StorageError(f"Failed to create session {session_id}: {e}") from e
+
+    async def append_message(
+        self,
+        session_id: str,
+        message: Message
+    ) -> None:
+        """
+        Append a single message to session history.
+
+        Uses RPUSH for atomic append to message list.
+        """
+        await self._ensure_connected()
+
+        message_key = self._message_key(session_id)
+
+        # Check if session exists
+        exists = await self.redis.exists(message_key)
+        if not exists:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        try:
+            # Serialize message
+            msg_data = serialize_message(message)
+            msg_json = json.dumps(msg_data, ensure_ascii=False)
+
+            # Atomic append to list
+            await self.redis.rpush(message_key, msg_json)
+
+            # Refresh TTL
+            ttl_seconds = int(self.default_ttl.total_seconds())
+            await self.redis.expire(message_key, ttl_seconds)
+
+        except SessionNotFoundError:
+            raise
+        except Exception as e:
+            raise StorageError(f"Failed to append message to {session_id}: {e}") from e
+
+    async def load_session(
+        self,
+        session_id: str
+    ) -> SessionState | None:
+        """
+        Load complete session state.
+
+        Retrieves messages from list and metadata from hash.
+        """
+        await self._ensure_connected()
+
+        message_key = self._message_key(session_id)
+        metadata_key = self._metadata_key(session_id)
+
+        # Check existence
+        exists = await self.redis.exists(message_key)
+        if not exists:
+            return None
+
+        try:
+            # Load messages from list
+            raw_messages = await self.redis.lrange(message_key, 0, -1)
+            messages = [
+                deserialize_message(json.loads(msg_json))
+                for msg_json in raw_messages
+            ]
+
+            # Load metadata from hash
+            metadata_dict = await self.redis.hgetall(metadata_key)
+            if metadata_dict:
+                # Convert string values back to correct types
+                metadata_dict = self._restore_metadata_types(metadata_dict)
+                metadata = SessionMetadata.from_dict(metadata_dict)
+            else:
+                metadata = SessionMetadata()
+
+            # Load timestamps
+            created_at_key = self._created_at_key(session_id)
+            created_at_str = await self.redis.get(created_at_key)
+            created_at = (
+                datetime.fromisoformat(created_at_str)
+                if created_at_str
+                else datetime.now()
+            )
+
+            return SessionState(
+                session_id=session_id,
+                messages=messages,
+                metadata=metadata,
+                created_at=created_at,
+                updated_at=datetime.now(),
+            )
+
+        except Exception as e:
+            raise StorageError(f"Failed to load session {session_id}: {e}") from e
+
+    def _restore_metadata_types(self, metadata_dict: dict) -> dict:
+        """
+        Restore proper types for metadata fields.
+
+        Redis hashes store all values as strings, so we need to convert back.
+        """
+        # Convert numeric fields
+        if "total_cost_usd" in metadata_dict:
+            metadata_dict["total_cost_usd"] = float(metadata_dict["total_cost_usd"])
+        if "num_turns" in metadata_dict:
+            metadata_dict["num_turns"] = int(metadata_dict["num_turns"])
+
+        # Convert JSON fields
+        if "allowed_tools" in metadata_dict:
+            metadata_dict["allowed_tools"] = json.loads(metadata_dict["allowed_tools"])
+        if "disallowed_tools" in metadata_dict:
+            metadata_dict["disallowed_tools"] = json.loads(metadata_dict["disallowed_tools"])
+        if "usage" in metadata_dict:
+            metadata_dict["usage"] = json.loads(metadata_dict["usage"])
+        if "compaction_state" in metadata_dict and metadata_dict["compaction_state"] != "null":
+            metadata_dict["compaction_state"] = json.loads(metadata_dict["compaction_state"])
+
+        return metadata_dict
+
+    async def session_exists(
+        self,
+        session_id: str
+    ) -> bool:
+        """
+        Check if session exists without loading full state.
+        """
+        await self._ensure_connected()
+        message_key = self._message_key(session_id)
+        return await self.redis.exists(message_key) > 0
+
+    async def update_metadata(
+        self,
+        session_id: str,
+        metadata: SessionMetadata
+    ) -> None:
+        """
+        Update session metadata.
+
+        Updates the metadata hash in Redis.
+        """
+        await self._ensure_connected()
+
+        metadata_key = self._metadata_key(session_id)
+
+        # Check if session exists
+        exists = await self.redis.exists(metadata_key)
+        if not exists:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        try:
+            # Serialize and update metadata
+            metadata_dict = metadata.to_dict()
+            await self.redis.hset(metadata_key, mapping=metadata_dict)
+
+            # Refresh TTL
+            ttl_seconds = int(self.default_ttl.total_seconds())
+            await self.redis.expire(metadata_key, ttl_seconds)
+
+        except Exception as e:
+            raise StorageError(f"Failed to update metadata for {session_id}: {e}") from e
+
+    async def close(self) -> None:
+        """Clean up Redis connection."""
+        if self.redis:
+            await self.redis.close()
+            self.redis = None
+```
+
+3. **Update `src/claude_agent_sdk/stores/__init__.py`** to export RedisSessionStore:
+   ```python
+   from claude_agent_sdk.stores.file_store import FileSessionStore
+   from claude_agent_sdk.stores.redis_store import RedisSessionStore
+
+   __all__ = ["FileSessionStore", "RedisSessionStore"]
+   ```
+
+4. **Install fakeredis for testing** - Add to `[dev]` dependencies: `fakeredis[lua]>=2.20.0`
+
+5. **Create unit tests** in `tests/stores/test_redis_store.py`:
+
+```python
+"""Tests for RedisSessionStore."""
+
+import pytest
+from datetime import datetime
+from fakeredis import aioredis as fakeredis
+from claude_agent_sdk.stores.redis_store import RedisSessionStore
+from claude_agent_sdk.models import SessionMetadata, Message
+from claude_agent_sdk.protocols import SessionNotFoundError, StorageError
+
+
+@pytest.fixture
+async def redis_store():
+    """Create a RedisSessionStore instance with fake Redis."""
+    store = RedisSessionStore(redis_url="redis://fake")
+    # Replace with fake Redis
+    store.redis = await fakeredis.FakeRedis(decode_responses=True)
+    yield store
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_create_session(redis_store):
+    """Test creating a new session in Redis."""
+    session_id = "test-redis-session"
+    metadata = SessionMetadata(model="claude-sonnet-4-5-20250929")
+
+    await redis_store.create_session(session_id, metadata)
+
+    # Verify keys were created
+    message_key = redis_store._message_key(session_id)
+    metadata_key = redis_store._metadata_key(session_id)
+
+    assert await redis_store.redis.exists(message_key)
+    assert await redis_store.redis.exists(metadata_key)
+
+
+@pytest.mark.asyncio
+async def test_session_exists(redis_store):
+    """Test checking if a session exists."""
+    session_id = "exists-test"
+
+    # Should not exist initially
+    assert not await redis_store.session_exists(session_id)
+
+    # Create session
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    # Should exist now
+    assert await redis_store.session_exists(session_id)
+
+
+@pytest.mark.asyncio
+async def test_append_message(redis_store):
+    """Test appending a message to Redis."""
+    session_id = "append-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    # Append message
+    msg = Message(role="user", content="Hello Redis!", id="msg-1")
+    await redis_store.append_message(session_id, msg)
+
+    # Verify message was added to list
+    message_key = redis_store._message_key(session_id)
+    count = await redis_store.redis.llen(message_key)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_append_message_to_nonexistent_session(redis_store):
+    """Test that appending to nonexistent session raises error."""
+    msg = Message(role="user", content="Test")
+
+    with pytest.raises(SessionNotFoundError):
+        await redis_store.append_message("nonexistent", msg)
+
+
+@pytest.mark.asyncio
+async def test_load_session(redis_store):
+    """Test loading a complete session from Redis."""
+    session_id = "load-test"
+    metadata = SessionMetadata(model="claude-opus-4", num_turns=2)
+
+    # Create session
+    await redis_store.create_session(session_id, metadata)
+
+    # Append messages
+    msg1 = Message(role="user", content="First", id="m1")
+    msg2 = Message(role="assistant", content="Second", id="m2")
+    await redis_store.append_message(session_id, msg1)
+    await redis_store.append_message(session_id, msg2)
+
+    # Load session
+    session = await redis_store.load_session(session_id)
+
+    assert session is not None
+    assert session.session_id == session_id
+    assert len(session.messages) == 2
+    assert session.messages[0].content == "First"
+    assert session.messages[1].content == "Second"
+    assert session.metadata.model == "claude-opus-4"
+
+
+@pytest.mark.asyncio
+async def test_load_nonexistent_session(redis_store):
+    """Test that loading nonexistent session returns None."""
+    session = await redis_store.load_session("does-not-exist")
+    assert session is None
+
+
+@pytest.mark.asyncio
+async def test_update_metadata(redis_store):
+    """Test updating session metadata in Redis."""
+    session_id = "metadata-test"
+    metadata = SessionMetadata(num_turns=0, total_cost_usd=0.0)
+
+    # Create session
+    await redis_store.create_session(session_id, metadata)
+
+    # Update metadata
+    updated_metadata = SessionMetadata(num_turns=5, total_cost_usd=1.23)
+    await redis_store.update_metadata(session_id, updated_metadata)
+
+    # Load and verify
+    session = await redis_store.load_session(session_id)
+    assert session.metadata.num_turns == 5
+    assert session.metadata.total_cost_usd == 1.23
+
+
+@pytest.mark.asyncio
+async def test_metadata_type_restoration(redis_store):
+    """Test that metadata types are correctly restored from Redis strings."""
+    session_id = "types-test"
+    metadata = SessionMetadata(
+        num_turns=10,
+        total_cost_usd=5.67,
+        allowed_tools=["tool1", "tool2"],
+        usage={"input_tokens": 100, "output_tokens": 50}
+    )
+
+    await redis_store.create_session(session_id, metadata)
+
+    # Load and verify types
+    session = await redis_store.load_session(session_id)
+    assert isinstance(session.metadata.num_turns, int)
+    assert isinstance(session.metadata.total_cost_usd, float)
+    assert isinstance(session.metadata.allowed_tools, list)
+    assert isinstance(session.metadata.usage, dict)
+
+
+@pytest.mark.asyncio
+async def test_protocol_compliance(redis_store):
+    """Test that RedisSessionStore satisfies SessionStore protocol."""
+    from claude_agent_sdk.protocols import SessionStore
+
+    assert isinstance(redis_store, SessionStore)
+```
+
+6. **Run the tests**:
+   ```bash
+   pytest tests/stores/test_redis_store.py -v --cov=src/claude_agent_sdk/stores/redis_store
+   ```
+
+7. **Update `src/claude_agent_sdk/__init__.py`** to export RedisSessionStore:
+   ```python
+   from claude_agent_sdk.stores import RedisSessionStore
+
+   __all__ = [
+       # ... existing exports ...
+       "RedisSessionStore",
+   ]
+   ```
+
+Ensure all tests pass and Redis store implements the basic SessionStore operations correctly.
+</prompt>
+
+---
+
+#### Task 8: Implement RedisSessionStore Advanced Operations
+
+Status: **Pending**
+
+**Goal**: Complete the RedisSessionStore implementation with advanced operations including session listing, deletion, forking, compaction, and message range queries optimized for Redis data structures.
+
+**Working Result**: A fully functional RedisSessionStore with all SessionStore protocol methods, leveraging Redis atomic operations (COPY, LRANGE, DEL) for efficient distributed storage.
+
+**Validation**:
+- [ ] `get_messages()` uses LRANGE for efficient message range retrieval
+- [ ] `list_sessions()` scans keys with pattern matching, filters by directory using sets
+- [ ] `delete_session()` deletes all related keys (messages, metadata, timestamps)
+- [ ] `fork_session()` uses Redis COPY command for atomic session duplication
+- [ ] `compact_session()` updates metadata with compaction state
+- [ ] All operations handle Redis connection errors gracefully
+- [ ] Unit tests cover all advanced operations with fakeredis
+- [ ] `pytest tests/stores/test_redis_store.py -v` passes with >95% coverage
+
+<prompt>
+You are completing the RedisSessionStore implementation by adding advanced operations optimized for Redis's data structures and commands.
+
+1. **Add the following methods to `src/claude_agent_sdk/stores/redis_store.py`**:
+
+```python
+    async def get_messages(
+        self,
+        session_id: str,
+        from_turn: int = 0,
+        to_turn: int | None = None
+    ) -> list[Message]:
+        """
+        Retrieve message history with optional range.
+
+        Uses Redis LRANGE for efficient range queries.
+        """
+        await self._ensure_connected()
+
+        message_key = self._message_key(session_id)
+
+        exists = await self.redis.exists(message_key)
+        if not exists:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        try:
+            # Redis LRANGE with negative indices for end of list
+            if to_turn is None:
+                raw_messages = await self.redis.lrange(message_key, from_turn, -1)
+            else:
+                raw_messages = await self.redis.lrange(message_key, from_turn, to_turn - 1)
+
+            messages = [
+                deserialize_message(json.loads(msg_json))
+                for msg_json in raw_messages
+            ]
+            return messages
+
+        except Exception as e:
+            raise StorageError(f"Failed to get messages from {session_id}: {e}") from e
+
+    async def list_sessions(
+        self,
+        working_directory: str | None = None,
+        limit: int = 100
+    ) -> list[str]:
+        """
+        List session IDs, optionally filtered by working directory.
+
+        Uses Redis key scanning and directory sets.
+        """
+        await self._ensure_connected()
+
+        try:
+            if working_directory is not None:
+                # Use directory index set
+                dir_key = self._directory_set_key(working_directory)
+                session_ids = await self.redis.smembers(dir_key)
+                # Convert set to list and limit
+                return list(session_ids)[:limit]
+            else:
+                # Scan all session message keys
+                session_ids = []
+                cursor = 0
+
+                while True:
+                    cursor, keys = await self.redis.scan(
+                        cursor,
+                        match="session:*:messages",
+                        count=100
+                    )
+
+                    # Extract session IDs from keys
+                    for key in keys:
+                        # Parse "session:{session_id}:messages"
+                        parts = key.split(":")
+                        if len(parts) >= 3:
+                            session_id = parts[1]
+                            session_ids.append(session_id)
+
+                    if cursor == 0:
+                        break
+
+                    if len(session_ids) >= limit:
+                        break
+
+                return session_ids[:limit]
+
+        except Exception as e:
+            raise StorageError(f"Failed to list sessions: {e}") from e
+
+    async def delete_session(
+        self,
+        session_id: str
+    ) -> None:
+        """
+        Permanently delete a session.
+
+        Removes all related Redis keys.
+        """
+        await self._ensure_connected()
+
+        message_key = self._message_key(session_id)
+
+        exists = await self.redis.exists(message_key)
+        if not exists:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        try:
+            # Get working directory before deleting
+            metadata_key = self._metadata_key(session_id)
+            metadata_dict = await self.redis.hgetall(metadata_key)
+
+            # Delete all session keys
+            created_at_key = self._created_at_key(session_id)
+            await self.redis.delete(message_key, metadata_key, created_at_key)
+
+            # Remove from directory index if we have metadata
+            if metadata_dict and "working_directory" in metadata_dict:
+                dir_key = self._directory_set_key(metadata_dict["working_directory"])
+                await self.redis.srem(dir_key, session_id)
+
+        except Exception as e:
+            raise StorageError(f"Failed to delete session {session_id}: {e}") from e
+
+    async def fork_session(
+        self,
+        source_session_id: str,
+        new_session_id: str
+    ) -> None:
+        """
+        Create a copy of a session with a new ID.
+
+        Uses Redis COPY command for atomic duplication.
+        """
+        await self._ensure_connected()
+
+        # Verify source exists
+        exists = await self.session_exists(source_session_id)
+        if not exists:
+            raise SessionNotFoundError(f"Source session {source_session_id} does not exist")
+
+        try:
+            # Copy all keys with new session ID
+            source_message_key = self._message_key(source_session_id)
+            source_metadata_key = self._metadata_key(source_session_id)
+            source_created_at_key = self._created_at_key(source_session_id)
+
+            dest_message_key = self._message_key(new_session_id)
+            dest_metadata_key = self._metadata_key(new_session_id)
+            dest_created_at_key = self._created_at_key(new_session_id)
+
+            # Copy message list
+            # Note: COPY command requires Redis 6.2+, fallback to manual copy
+            try:
+                await self.redis.copy(source_message_key, dest_message_key)
+            except Exception:
+                # Manual copy for older Redis versions
+                messages = await self.redis.lrange(source_message_key, 0, -1)
+                if messages:
+                    await self.redis.rpush(dest_message_key, *messages)
+
+            # Copy metadata hash
+            try:
+                await self.redis.copy(source_metadata_key, dest_metadata_key)
+            except Exception:
+                # Manual copy
+                metadata = await self.redis.hgetall(source_metadata_key)
+                if metadata:
+                    await self.redis.hset(dest_metadata_key, mapping=metadata)
+
+            # Set new created_at
+            await self.redis.set(dest_created_at_key, datetime.now().isoformat())
+
+            # Add to directory index
+            metadata_dict = await self.redis.hgetall(dest_metadata_key)
+            if metadata_dict and "working_directory" in metadata_dict:
+                dir_key = self._directory_set_key(metadata_dict["working_directory"])
+                await self.redis.sadd(dir_key, new_session_id)
+
+            # Set TTL on new keys
+            ttl_seconds = int(self.default_ttl.total_seconds())
+            await self.redis.expire(dest_message_key, ttl_seconds)
+            await self.redis.expire(dest_metadata_key, ttl_seconds)
+            await self.redis.expire(dest_created_at_key, ttl_seconds)
+
+        except SessionNotFoundError:
+            raise
+        except Exception as e:
+            raise StorageError(f"Failed to fork session {source_session_id}: {e}") from e
+
+    async def compact_session(
+        self,
+        session_id: str,
+        compaction_state: CompactionState
+    ) -> None:
+        """
+        Apply context compaction to session.
+
+        Updates metadata with compaction state.
+        """
+        # Load current session
+        session = await self.load_session(session_id)
+        if session is None:
+            raise SessionNotFoundError(f"Session {session_id} does not exist")
+
+        # Update metadata with compaction state
+        session.metadata.compaction_state = compaction_state
+
+        # Update metadata in Redis
+        await self.update_metadata(session_id, session.metadata)
+```
+
+2. **Add comprehensive tests for advanced operations** in `tests/stores/test_redis_store.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_get_messages_full_range(redis_store):
+    """Test getting all messages from a session."""
+    session_id = "messages-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    # Add several messages
+    for i in range(5):
+        await redis_store.append_message(
+            session_id,
+            Message(role="user", content=f"Message {i}", id=f"m{i}")
+        )
+
+    messages = await redis_store.get_messages(session_id)
+    assert len(messages) == 5
+    assert messages[0].content == "Message 0"
+    assert messages[4].content == "Message 4"
+
+
+@pytest.mark.asyncio
+async def test_get_messages_with_range(redis_store):
+    """Test getting a subset of messages using range."""
+    session_id = "range-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    for i in range(10):
+        await redis_store.append_message(
+            session_id,
+            Message(role="user", content=f"Msg {i}", id=f"m{i}")
+        )
+
+    # Get messages 3-7
+    messages = await redis_store.get_messages(session_id, from_turn=3, to_turn=7)
+    assert len(messages) == 4
+    assert messages[0].content == "Msg 3"
+    assert messages[3].content == "Msg 6"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions(redis_store):
+    """Test listing all sessions."""
+    # Create multiple sessions
+    for i in range(3):
+        await redis_store.create_session(f"session-{i}", SessionMetadata())
+
+    sessions = await redis_store.list_sessions()
+    assert len(sessions) == 3
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_directory(redis_store):
+    """Test filtering sessions by working directory."""
+    metadata1 = SessionMetadata(working_directory="/tmp/project1")
+    metadata2 = SessionMetadata(working_directory="/tmp/project2")
+
+    await redis_store.create_session("session-1", metadata1)
+    await redis_store.create_session("session-2", metadata2)
+    await redis_store.create_session("session-3", metadata1)
+
+    # List sessions in project1
+    sessions = await redis_store.list_sessions(working_directory="/tmp/project1")
+    assert len(sessions) == 2
+    assert "session-1" in sessions
+    assert "session-3" in sessions
+
+
+@pytest.mark.asyncio
+async def test_delete_session(redis_store):
+    """Test deleting a session from Redis."""
+    session_id = "delete-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    # Verify exists
+    assert await redis_store.session_exists(session_id)
+
+    # Delete
+    await redis_store.delete_session(session_id)
+
+    # Verify gone
+    assert not await redis_store.session_exists(session_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_all_keys(redis_store):
+    """Test that deletion removes all related keys."""
+    session_id = "delete-keys-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+    await redis_store.append_message(
+        session_id,
+        Message(role="user", content="Test", id="m1")
+    )
+
+    # Get key names
+    message_key = redis_store._message_key(session_id)
+    metadata_key = redis_store._metadata_key(session_id)
+    created_at_key = redis_store._created_at_key(session_id)
+
+    # Delete
+    await redis_store.delete_session(session_id)
+
+    # Verify all keys gone
+    assert not await redis_store.redis.exists(message_key)
+    assert not await redis_store.redis.exists(metadata_key)
+    assert not await redis_store.redis.exists(created_at_key)
+
+
+@pytest.mark.asyncio
+async def test_fork_session(redis_store):
+    """Test forking a session in Redis."""
+    source_id = "source-session"
+    fork_id = "forked-session"
+
+    # Create source with messages
+    metadata = SessionMetadata(model="claude-opus-4")
+    await redis_store.create_session(source_id, metadata)
+    await redis_store.append_message(
+        source_id,
+        Message(role="user", content="Original", id="m1")
+    )
+
+    # Fork
+    await redis_store.fork_session(source_id, fork_id)
+
+    # Verify fork exists and has same content
+    fork_session = await redis_store.load_session(fork_id)
+    assert fork_session is not None
+    assert len(fork_session.messages) == 1
+    assert fork_session.messages[0].content == "Original"
+    assert fork_session.metadata.model == "claude-opus-4"
+
+    # Verify source unchanged
+    source_session = await redis_store.load_session(source_id)
+    assert source_session is not None
+
+
+@pytest.mark.asyncio
+async def test_fork_nonexistent_session(redis_store):
+    """Test that forking nonexistent session raises error."""
+    with pytest.raises(SessionNotFoundError):
+        await redis_store.fork_session("nonexistent", "new-fork")
+
+
+@pytest.mark.asyncio
+async def test_compact_session(redis_store):
+    """Test applying context compaction."""
+    from claude_agent_sdk.models import CompactionState
+
+    session_id = "compact-test"
+    await redis_store.create_session(session_id, SessionMetadata())
+
+    for i in range(5):
+        await redis_store.append_message(
+            session_id,
+            Message(role="user", content=f"Msg {i}", id=f"m{i}")
+        )
+
+    # Apply compaction
+    compaction = CompactionState(
+        last_compaction_turn=3,
+        summary="Summary of early messages",
+        original_message_ids=["m0", "m1", "m2"]
+    )
+    await redis_store.compact_session(session_id, compaction)
+
+    # Verify compaction saved
+    session = await redis_store.load_session(session_id)
+    assert session.metadata.compaction_state is not None
+    assert session.metadata.compaction_state.last_compaction_turn == 3
+
+
+@pytest.mark.asyncio
+async def test_connection_management(redis_store):
+    """Test that Redis connection is properly managed."""
+    # Initially not connected
+    assert redis_store.redis is not None  # Already set in fixture
+
+    # Operations should work
+    await redis_store.create_session("test", SessionMetadata())
+
+    # Close should clean up
+    await redis_store.close()
+    assert redis_store.redis is None
+```
+
+3. **Run all Redis store tests**:
+   ```bash
+   pytest tests/stores/test_redis_store.py -v --cov=src/claude_agent_sdk/stores/redis_store --cov-report=term-missing
+   ```
+
+4. **Verify protocol compliance**:
+   ```bash
+   mypy src/claude_agent_sdk/stores/redis_store.py --strict
+   ```
+
+Ensure all tests pass with high coverage and RedisSessionStore fully implements the SessionStore protocol with Redis-optimized operations.
+</prompt>
+
+---
+
